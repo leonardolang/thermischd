@@ -1,0 +1,10 @@
+[Unit]
+Description=Thermal management daemon
+After=local-fs.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/thermischd
+
+[Install]
+WantedBy=multi-user.target
