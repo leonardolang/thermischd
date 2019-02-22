@@ -1,19 +1,24 @@
+open Printf
 open Base
 open Stdio
-open Printf
 
 (* TODO *********************************************************
-    * add "state" structure with:
-        - trippoints
-        - current point
-        - accumulator
     * add support for writing on files as actions? (ie sysfs?)
     * read settings from file, supporting other methods for
       retrieving temperature (like running a program)
  ***************************************************************)
 
 type action =
-    Spawns of string list
+    Spawns of string * string list
+;;
+
+type state =
+{
+    s_tps: (int * int * action) Array.t;
+    s_cur_tp: int;
+    s_new_tp: int;
+    s_accum: int;
+}
 ;;
 
 let hwmon_base = "/sys/class/hwmon";;
@@ -32,9 +37,9 @@ let sources =
 
 let trippoints =
 [|
-    ( 0,  65, Spawns [ "/usr/bin/i8kctl"; "fan"; "-"; "0" ]);
-    (60,  80, Spawns [ "/usr/bin/i8kctl"; "fan"; "-"; "1" ]);
-    (70, 999, Spawns [ "/usr/bin/i8kctl"; "fan"; "-"; "2" ]);
+    ( 0,  65, Spawns ("/usr/bin/i8kctl", [ "fan"; "-"; "0" ]));
+    (60,  80, Spawns ("/usr/bin/i8kctl", [ "fan"; "-"; "1" ]));
+    (70, 999, Spawns ("/usr/bin/i8kctl", [ "fan"; "-"; "2" ]));
 |]
 ;;
 
@@ -48,31 +53,40 @@ let point_getaction p =
     let (_,_,r) = p in r
 ;;
 
-let dbgmsg s =
-    let str = try Unix.getenv "DEBUG" with Caml.Not_found -> "0" in
-    let num = try Int.of_string str with Failure _ -> 0 in
-    if Int.compare num 0 > 0 then print_endline s
+let debug_level =
+    let strval =
+        try Unix.getenv "DEBUG" with Caml.Not_found -> "0"
+    in
+        try Int.of_string strval with Failure _ -> 0
+
+let dbgmsg lvl s =
+    if Int.compare debug_level lvl >= 0 then
+    begin
+        printf "%s %s\n" (String.make lvl '+') s;
+        Out_channel.flush stdout
+    end
 ;;
 
 let logmsg = print_endline
 ;;
 
 let get_max_temp lst =
-    dbgmsg (sprintf "Reading temperatures...");
+    dbgmsg 2 (sprintf "Reading temperatures...");
     List.fold lst ~init:(0, "none") ~f:begin fun res name ->
-        In_channel.with_file (sprintf "%s/%s_input" hwmon_base name)
-            ~f:begin fun fd ->
-                match In_channel.input_line fd with
-                  Some strvalue ->
-                    let value = Int.of_string strvalue in
-                    let value = if value > 999 then value / 1000 else value in
-                    if Int.compare (fst res) value < 0
-                    then (value, name)
-                    else res
+        let fname = sprintf "%s/%s_input" hwmon_base name in
+        In_channel.with_file fname ~f:begin fun fd ->
+            match In_channel.input_line fd with
+              Some strvalue ->
+                dbgmsg 3 (sprintf "Read %s from %s" strvalue fname);
+                let value = Int.of_string strvalue in
+                let value = if value > 999 then value / 1000 else value in
+                if Int.compare (fst res) value < 0
+                then (value, name)
+                else res
 
-                | None -> res
-            end
+            | None -> res
         end
+    end
 ;;
 
 let check_trippoint data temp =
@@ -88,11 +102,11 @@ let find_trippoint temp points cur =
     in
         if valid
         then begin
-            dbgmsg (sprintf "Temperature %d still matches trippoint %d..." temp cur);
+            dbgmsg 1 (sprintf "Temperature %d still matches trippoint %d..." temp cur);
             cur
         end else
             Array.foldi points ~init:cur ~f:begin fun num res data ->
-                dbgmsg (sprintf "Checking trippoint %d with temp %d..." num temp);
+                dbgmsg 2 (sprintf "Checking trippoint %d with temp %d..." num temp);
                 if check_trippoint data temp then num else res
             end
 ;;
@@ -121,40 +135,58 @@ let spawn_process prog argv =
 
 let trigger_action points num =
     match point_getaction trippoints.(num) with
-      Spawns cmd -> spawn_process (List.nth_exn cmd 0) cmd
+      Spawns (cmd, args) -> spawn_process cmd (cmd :: args)
 ;;
 
-let verify_accumulator acc want_acc points got cur =
-    if (Int.compare acc want_acc) >= 0 || (Int.compare cur (-1)) = 0
+let verify_new_state state maxtemp new_tp want_acc =
+    if (Int.compare state.s_cur_tp (-1)) = 0
     then begin
-        logmsg (sprintf "Trip point changed: %d -> %d (%d cycles), triggering actions..." cur got acc);
-        trigger_action points got;
-        0, got
-    end else begin
-        logmsg (sprintf "Trip point %d detected for %d cycles (current is %d)..." got acc cur);
-        (acc+1), cur
-    end
+        logmsg (sprintf "Setting initial trip point %d and triggering actions..." new_tp);
+        trigger_action state.s_tps new_tp;
+        (0, new_tp, new_tp)
+    end else
+        if (Int.compare state.s_new_tp new_tp) <> 0
+        then begin
+            dbgmsg 1 (sprintf "New trip point %d detected (temp %dC)..." new_tp maxtemp);
+            1, state.s_cur_tp, new_tp
+        end else
+            if (Int.compare state.s_accum want_acc) >= 0
+            then begin
+                logmsg (sprintf "Trip point changed: %d -> %d: triggering actions..." state.s_cur_tp new_tp);
+                trigger_action state.s_tps new_tp;
+                0, new_tp, new_tp
+            end else begin
+                (state.s_accum + 1), state.s_cur_tp, new_tp
+            end
 ;;
 
-let main () =
-    let rec loops cur acc =
-        dbgmsg (sprintf "Running main loop...");
-        Out_channel.flush stdout;
+let verify_cur_state state maxtemp =
+    if (Int.compare state.s_accum 0) > 1
+    then begin
+        if (Int.compare state.s_new_tp state.s_cur_tp) <> 0
+        then logmsg (sprintf "Trip point %d not detected anymore (temp %dC)..." state.s_new_tp maxtemp);
+        (state.s_accum - 1), state.s_cur_tp, state.s_new_tp
+    end else
+        0, state.s_cur_tp, state.s_cur_tp
+
+let main tps =
+    let rec loops state =
+        dbgmsg 2 (sprintf "Running main loop...");
         let maxtemp, maxname = get_max_temp sources in
-        let got = find_trippoint maxtemp trippoints cur in
-        let (acc, got), delay =
-            match Int.compare got cur with
-              -1 -> (verify_accumulator acc 3 trippoints got cur), 1
-            |  1 -> (verify_accumulator acc 2 trippoints got cur), 1
-            |  _ -> let acc = if (Int.compare acc 0) > 1 then acc-1 else 1 in (acc, cur), 3
+        let new_tp = find_trippoint maxtemp state.s_tps state.s_cur_tp in
+        let (accum, cur_tp, new_tp), delay =
+            match Int.compare new_tp state.s_cur_tp with
+              -1 -> (verify_new_state state maxtemp new_tp 3), 1
+            |  1 -> (verify_new_state state maxtemp new_tp 2), 1
+            |  _ -> (verify_cur_state state maxtemp), 3
         in begin
-            Caml.Gc.full_major ();
+            Caml.Gc.major ();
             Unix.sleep delay;
-            loops got acc
+            loops { state with s_cur_tp = cur_tp; s_new_tp = new_tp; s_accum = accum; }
         end
     in
-        loops (-1) 1
+        loops { s_tps = tps; s_cur_tp = (-1); s_new_tp = (-1); s_accum = 1; }
 ;;
 
-main ()
+main trippoints
 ;;
