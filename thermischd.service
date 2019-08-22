@@ -5,6 +5,8 @@ After=local-fs.target
 [Service]
 Type=simple
 ExecStart=/usr/local/bin/thermischd
+Restart=on-failure
+RestartSec=5
 
 [Install]
 WantedBy=multi-user.target

@@ -3,6 +3,7 @@ open Base
 open Stdio
 
 (* TODO *********************************************************
+    * fix logic: return on first match (fold_until)
     * add support for writing on files as actions? (ie sysfs?)
     * read settings from file, supporting other methods for
       retrieving temperature (like running a program)
@@ -37,8 +38,8 @@ let sources =
 
 let trippoints =
 [|
-    ( 0,  65, Spawns ("/usr/bin/i8kctl", [ "fan"; "-"; "0" ]));
-    (60,  80, Spawns ("/usr/bin/i8kctl", [ "fan"; "-"; "1" ]));
+    ( 0,  60, Spawns ("/usr/bin/i8kctl", [ "fan"; "-"; "0" ]));
+    (55,  77, Spawns ("/usr/bin/i8kctl", [ "fan"; "-"; "1" ]));
     (70, 999, Spawns ("/usr/bin/i8kctl", [ "fan"; "-"; "2" ]));
 |]
 ;;
@@ -62,7 +63,7 @@ let debug_level =
 let dbgmsg lvl s =
     if Int.compare debug_level lvl >= 0 then
     begin
-        printf "%s %s\n" (String.make lvl '+') s;
+        printf "%s %s\n" (String.make lvl '*') s;
         Out_channel.flush stdout
     end
 ;;
@@ -74,7 +75,7 @@ let get_max_temp lst =
     dbgmsg 2 (sprintf "Reading temperatures...");
     List.fold lst ~init:(0, "none") ~f:begin fun res name ->
         let fname = sprintf "%s/%s_input" hwmon_base name in
-        In_channel.with_file fname ~f:begin fun fd ->
+        try In_channel.with_file fname ~f:begin fun fd ->
             match In_channel.input_line fd with
               Some strvalue ->
                 dbgmsg 3 (sprintf "Read %s from %s" strvalue fname);
@@ -85,7 +86,12 @@ let get_max_temp lst =
                 else res
 
             | None -> res
-        end
+        end with
+            Sys_error msg ->
+                begin
+                    logmsg (sprintf "WARNING: %s, skipping file '%s'" msg fname);
+                    res
+                end
     end
 ;;
 
@@ -152,7 +158,7 @@ let verify_new_state state maxtemp new_tp want_acc =
         end else
             if (Int.compare state.s_accum want_acc) >= 0
             then begin
-                logmsg (sprintf "Trip point changed: %d -> %d: triggering actions..." state.s_cur_tp new_tp);
+                logmsg (sprintf "Trip point changed: %d -> %d (temp %dC): triggering actions..." state.s_cur_tp new_tp maxtemp);
                 trigger_action state.s_tps new_tp;
                 0, new_tp, new_tp
             end else begin
@@ -176,12 +182,12 @@ let main tps =
         let new_tp = find_trippoint maxtemp state.s_tps state.s_cur_tp in
         let (accum, cur_tp, new_tp), delay =
             match Int.compare new_tp state.s_cur_tp with
-              -1 -> (verify_new_state state maxtemp new_tp 3), 1
-            |  1 -> (verify_new_state state maxtemp new_tp 2), 1
-            |  _ -> (verify_cur_state state maxtemp), 3
+              -1 -> (verify_new_state state maxtemp new_tp 3), 0.10
+            |  1 -> (verify_new_state state maxtemp new_tp 2), 0.10
+            |  _ -> (verify_cur_state state maxtemp), 0.45
         in begin
             Caml.Gc.major ();
-            Unix.sleep delay;
+            Unix.sleepf delay;
             loops { state with s_cur_tp = cur_tp; s_new_tp = new_tp; s_accum = accum; }
         end
     in
