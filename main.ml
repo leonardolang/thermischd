@@ -1,6 +1,7 @@
 open Printf
 open Base
 open Stdio
+open Caml.Sys
 
 (* TODO *********************************************************
     * fix logic: return on first match (fold_until)
@@ -26,22 +27,27 @@ let hwmon_base = "/sys/class/hwmon";;
 
 let sources =
 [
-    "hwmon2/temp1";
-    "hwmon2/temp2";
-    "hwmon2/temp3";
-    "hwmon2/temp4";
-    "hwmon2/temp5";
-    "hwmon2/temp6";
-    "hwmon2/temp7"
+    "temp1";
+    "temp2";
+    "temp3";
+    "temp4";
+    "temp5";
+    "temp6";
+    "temp7"
 ]
 ;;
-
 let trippoints =
 [|
-    ( 0,  60, Spawns ("/usr/bin/i8kctl", [ "fan"; "-"; "0" ]));
-    (55,  77, Spawns ("/usr/bin/i8kctl", [ "fan"; "-"; "1" ]));
-    (70, 999, Spawns ("/usr/bin/i8kctl", [ "fan"; "-"; "2" ]));
+    ( 0,  50, Spawns ("/usr/bin/i8kctl", [ "fan"; "-"; "0" ]));
+    (40,  70, Spawns ("/usr/bin/i8kctl", [ "fan"; "-"; "1" ]));
+    (65, 999, Spawns ("/usr/bin/i8kctl", [ "fan"; "-"; "2" ]));
 |]
+;;
+
+let forced_tp = 2 (* make this a setting *)
+;;
+
+let static_tp = ref None
 ;;
 
 let point_getmin p =
@@ -71,10 +77,26 @@ let dbgmsg lvl s =
 let logmsg = print_endline
 ;;
 
-let get_max_temp lst =
+let scan_hwmon name =
+    dbgmsg 2 (sprintf "Looking for %s monitor..." name);
+    match
+        Array.find (readdir hwmon_base) begin fun item ->
+            let data = In_channel.with_file (sprintf "%s/%s/name" hwmon_base item) ~f:In_channel.input_line_exn in
+            begin
+                dbgmsg 2 (sprintf "Checking %s (%s)..." item data);
+                (String.compare name data) = 0
+            end
+        end
+    with
+      Some(hwmon) -> hwmon
+    | None -> failwith ("hwmon " ^ name ^ " not found")
+;;
+
+
+let get_max_temp hwmon lst =
     dbgmsg 2 (sprintf "Reading temperatures...");
     List.fold lst ~init:(0, "none") ~f:begin fun res name ->
-        let fname = sprintf "%s/%s_input" hwmon_base name in
+        let fname = sprintf "%s/%s/%s_input" hwmon_base hwmon name in
         try In_channel.with_file fname ~f:begin fun fd ->
             match In_channel.input_line fd with
               Some strvalue ->
@@ -120,7 +142,7 @@ let find_trippoint temp points cur =
 let spawn_process prog argv =
     logmsg (sprintf "+ Spawning: %s" (String.concat ~sep:" " argv));
     let pid, inp =
-        let nil = Unix.openfile "/dev/null" [ O_RDONLY ] 0o000 in
+        let nil = Unix.openfile "/dev/null" [ Unix.O_RDONLY ] 0o000 in
         let rd, wr = Unix.pipe () in
         let pid = Unix.create_process prog (Array.of_list argv) nil wr wr in
         begin
@@ -132,11 +154,11 @@ let spawn_process prog argv =
         Stdio.In_channel.iter_lines inp (fun s -> logmsg (sprintf "[%s] %s" prog s));
         let (_,status) = Unix.waitpid [] pid in
         match status with
-          WEXITED ret when ret <> 0 ->
+          Unix.WEXITED ret when ret <> 0 ->
             logmsg (sprintf "ERROR: process %s[%d] returned %d" prog pid ret)
-        | WSIGNALED s | WSTOPPED s ->
+        | Unix.WSIGNALED s | Unix.WSTOPPED s ->
             logmsg (sprintf "ERROR: process %s[%d] killed/stopped by signal %d" prog pid s)
-        | WEXITED _ -> ()
+        | Unix.WEXITED _ -> ()
     end
 
 let trigger_action points num =
@@ -175,11 +197,16 @@ let verify_cur_state state maxtemp =
     end else
         0, state.s_cur_tp, state.s_cur_tp
 
-let main tps =
+let main hwmon tps =
     let rec loops state =
         dbgmsg 2 (sprintf "Running main loop...");
-        let maxtemp, maxname = get_max_temp sources in
-        let new_tp = find_trippoint maxtemp state.s_tps state.s_cur_tp in
+        let maxtemp, maxname = get_max_temp hwmon sources in
+        let min_tp = find_trippoint maxtemp state.s_tps state.s_cur_tp in
+        let new_tp =
+            match !static_tp with
+              None    -> min_tp
+            | Some tp -> if min_tp <= tp then tp else min_tp
+        in
         let (accum, cur_tp, new_tp), delay =
             match Int.compare new_tp state.s_cur_tp with
               -1 -> (verify_new_state state maxtemp new_tp 3), 0.10
@@ -194,5 +221,19 @@ let main tps =
         loops { s_tps = tps; s_cur_tp = (-1); s_new_tp = (-1); s_accum = 1; }
 ;;
 
-main trippoints
+set_signal sigusr1 (Signal_handle begin fun _ ->
+    logmsg (sprintf "Forcing trip point to %d" forced_tp);
+    static_tp := (Some forced_tp)
+end)
+;;
+
+set_signal sigusr2 (Signal_handle begin fun _ ->
+    logmsg (sprintf "Clearing forced trip point");
+    static_tp :=  None
+end)
+;;
+
+let hwmon = scan_hwmon "coretemp";;
+
+main hwmon trippoints
 ;;
